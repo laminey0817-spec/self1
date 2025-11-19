@@ -1,0 +1,205 @@
+% 先运行 Channel_setup_R.m 生成信道；
+% 命令行显示的每个case是指一个48*10的信道的实现，SER1和SER2是指这次实现中的误码率和修正后的误码率
+% SERall1和SERall2是指以上所有次实现的总的误码率和修正后的误码率
+
+clear;
+clc;
+setupPath;
+rng('default');
+optIn.SNRList = 10:5:10; % 信噪比
+SNRList = optIn.SNRList;
+numSNR = length(optIn.SNRList); % 信噪比个数
+optIn.cycle = 10;  % 循环次数（4RB的cycle次循环）（注意要比产生的信道文件的信道数少）
+optIn.M = 4; % 天线数
+optIn.N = 4; % 用户数
+optIn.k = 1; % TDLA B C 三个信道的选择（此份代码中没有时域分块，故不适合运行TDLB）
+optIn.RB = 4; % 把4RB分成的块数 4 8 16（对应运行BiG-AMP不同的信号长度：120 60 30）
+optIn.Priority_queue = 0; % 是否调用优先队列的方法
+optIn.Priority_proportion = 4/5; % 优先队列中一个用户的数据有多少是相同的则认为是相同的
+optIn.maxTrials = 5; % parallel_BiGAMP 循环层的循环次数
+optIn.inIt = 200; % 内层循环次数（BiGAMP） origin:200
+optIn.outIt = 2;  % 中层循环次数（EMBiGAMP）
+optIn.L = 480 / optIn.RB; % 每次bigamp的信号长度 120 60 30
+optIn.J = 48 / optIn.RB; % 一次送进算法的载波个数 12 6 3
+optIn.threshold_var_revise = 0.1; % 需要修正方差的阈值，大于此值则认为估计的不够准确，会进行修正
+optIn.length_t = 10; % OFDM symbol个数
+optIn.alphabet = [1,1i,-1,-1i];  % qpsk
+optIn.spar = 1-1e-12; %稀疏度 即后面的lambda 这里没有稀疏性，所以稀疏度为1
+optIn.Avar = 1; % 初始化时的信道方差
+
+global alphabet;
+alphabet = optIn.alphabet;
+cycle = optIn.cycle;
+
+%% for ML（X的所有可能性）
+temp0 = [1 2 3 4];
+temp1 = ones(1,64);
+temp2 = ones(1,16);
+t21 = [temp2 2*temp2 3*temp2 4*temp2];
+temp3 = ones(1,4);
+t31 = [temp3 2*temp3 3*temp3 4*temp3];
+t32 = [t31 t31 t31 t31];
+t41 = [temp0 temp0 temp0 temp0];
+t42 = [t41 t41 t41 t41];
+X_ML_matrix(1,:) = [temp1 2*temp1 3*temp1 4*temp1];
+X_ML_matrix(2,:) = [t21 t21 t21 t21];
+X_ML_matrix(3,:) = [t32 t32 t32 t32];
+X_ML_matrix(4,:) = [t42 t42 t42 t42];
+
+X_ML_matrix(X_ML_matrix == 1) = alphabet(1);
+X_ML_matrix(X_ML_matrix == 2) = alphabet(2);
+X_ML_matrix(X_ML_matrix == 3) = alphabet(3);
+X_ML_matrix(X_ML_matrix == 4) = alphabet(4);
+% 得到X的所有种可能（一共256种），for ML
+optIn.X_ML_matrix = X_ML_matrix; % 4个用户
+
+
+%% 读信道
+if optIn.k == 1
+    load('Channel_TDLA30_R.mat','H','R_1','R_2','R_3','R_4','average_variance_H_A');
+    optIn.average_variance_H = average_variance_H_A;
+elseif optIn.k == 2
+    load('Channel_TDLB100_R.mat','H','R_1','R_2','R_3','R_4','average_variance_H_B');
+    optIn.average_variance_H = average_variance_H_B;
+else
+    load('Channel_TDLC300_R.mat','H','R_1','R_2','R_3','R_4','average_variance_H_C');
+    optIn.average_variance_H = average_variance_H_C;
+end
+optIn.var_slope = optIn.average_variance_H;
+optIn.R_1 = R_1;
+optIn.R_2 = R_2;
+optIn.R_3 = R_3;
+optIn.R_4 = R_4;
+    
+%% 定义一些变量
+EM_cycle = zeros(cycle,numSNR);
+BiG_cycle = zeros(cycle,numSNR);
+PER = zeros(cycle,numSNR);
+SER1 = zeros(cycle,numSNR);
+SER2 = zeros(cycle,numSNR);
+BER1 = zeros(cycle,numSNR);
+BER2 = zeros(cycle,numSNR);
+
+MSE1 = zeros(cycle,numSNR);
+MSE2 = zeros(cycle,numSNR);
+MSE3 = zeros(cycle,numSNR);
+idx = 1;
+jdx = 1;
+
+%%
+while idx <= cycle
+    X = strcat('case',num2str(idx)); 
+    disp(X);
+    
+    while (jdx <= numSNR)
+        
+        optIn.SNR = SNRList(jdx);  %取snr的第j个
+       
+        % 产生信号、处理信道
+        [Signal,optIn] = generateSignal(optIn, H,idx);
+        
+        % Run BiG-AMP
+        % 比如长度120的情况，则是解4次再拼回网格中；长度60的情况是解8次BiG再拼回网格中
+        for ii = 1:optIn.RB
+            % 产生噪声
+            optIn.W =  (randn(optIn.M, optIn.L)+randn(optIn.M, optIn.L)*1i) ./ sqrt(2) * sqrt(10^(-SNRList(jdx)/10));
+            % 产生接收信号
+            optIn.Y = Signal.Y_nonoise(:,:,ii) + optIn.W;
+            % 记录下所有的接收信号Y，为方便后面拼回网格
+            optIn.Y_allRB(:,:,ii) = optIn.Y;
+            optIn.Wvar = 10^(-SNRList(jdx)/10);
+            
+            % Run parallel_BiGAMP
+            [results1,optIn] = parallel_BiGAMP(optIn);
+            
+            % 记录BiG-AMP的结果（未修正的结果）
+            result_all1.xhat(:,:,ii) = results1.xhat_final;
+            result_all1.xvar(:,:,ii) = results1.xvar_final;
+            result_all1.Ahat(:,:,ii) = results1.Ahat_final; 
+            % 循环次数的统计
+            result_all1.sum_EM_cycle(ii) = results1.sum_EM_cycle;
+            result_all1.sum_BiG_cycle(ii) = results1.sum_BiG_cycle;            
+        end
+        
+        % 修正(对实际时频信道的改进)
+        [results2,result_all1] = revise(optIn,result_all1);
+                
+        % 误码率统计
+        errRes = checkErrorBiGAMP(optIn,result_all1,results2,Signal);
+        
+        %% 误码率
+        % 第一次bigamp
+        MSE1(idx,jdx) = errRes.MSE1;
+        average_MSE1 = mean(MSE1(1:idx,:),1);
+
+        % 一次bigamp+白化+维纳滤波
+        MSE2(idx,jdx) = errRes.MSE2;
+        average_MSE2 = mean(MSE2(1:idx,:),1);
+
+         % 一次bigamp+不白化+维纳滤波
+        MSE3(idx,jdx) = errRes.MSE3;
+        average_MSE3 = mean(MSE3(1:idx,:),1);
+
+        % SER(只有一次BiG-AMP)
+        SER1(idx,jdx) = errRes.SER1;
+        average_SER1 = mean(SER1(1:idx,:),1);
+        
+        % SER(一次BiG-AMP+修正后的)
+        SER2(idx,jdx) = errRes.SER2;
+        average_SER2 = mean(SER2(1:idx,:),1);
+
+        % SER(一次BiG-AMP+修正后的-均值斜挎)
+        SER2_junzhixielv(idx,jdx) = errRes.SER2_junzhixielv;
+        average_SER2_junzhixielv = mean(SER2_junzhixielv(1:idx,:),1);
+
+        % BER(一次BiG-AMP+修正后的-均值斜挎)
+        BER2_junzhixielv(idx,jdx) = errRes.BER2_junzhixielv;
+        average_BER2_junzhixielv = mean(BER2_junzhixielv(1:idx,:),1);
+                
+        % BER(一次BiG-AMP)
+        BER1(idx,jdx) = errRes.BER1;
+        average_BER1 = mean(BER1(1:idx,:),1);
+        
+        % BER(一次BiG-AMP+修正后的)
+        BER2(idx,jdx) = errRes.BER2;
+        average_BER2 = mean(BER2(1:idx,:),1);
+
+        % 循环次数
+        EM_cycle(idx,jdx) = mean(result_all1.sum_EM_cycle);
+        BiG_cycle(idx,jdx) = mean(result_all1.sum_BiG_cycle);
+        
+        % 求一个信噪比的平均循环次数
+        average_EM_cycle = mean(EM_cycle(1:idx,:),1);
+        average_BiG_cycle = mean(BiG_cycle(1:idx,:),1);
+        
+        X = ['SNR:',num2str(SNRList(jdx)),'dB',...
+            '-BER1:',num2str(BER1(idx,jdx))
+            ];
+        
+        disp(X);
+        
+        jdx = jdx + 1;
+    end
+    
+    jdx = 1;
+    idx = idx + 1;
+end
+
+
+
+% 计算所有case的平均BER
+average_BER1_overall = mean(BER1, 1);
+
+
+figure;
+semilogy(SNRList, average_BER1, 'b-o', 'LineWidth', 2, 'DisplayName', 'BiG-AMP 原始 (BER1)');
+hold on;
+
+semilogy(SNRList, average_BER2, 'r-s', 'LineWidth', 2, 'DisplayName', '逐载波修正 (BER2)');
+semilogy(SNRList, average_BER2_junzhixielv, 'g-^', 'LineWidth', 2, 'DisplayName', '均值斜率修正 (BER2 junzhixielv)');
+
+grid on;
+xlabel('SNR (dB)');
+ylabel('Average Bit Error Rate (BER)');
+legend;
+title('BER vs. SNR 性能');
